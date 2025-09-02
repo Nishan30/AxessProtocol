@@ -27,7 +27,8 @@ module UnifiedCompute::escrow {
         next_job_id: u64,
     }
 
-    struct Job has store, drop {
+    struct Job has store, drop,copy {
+        job_id:u64,
         renter_address: address,
         host_address: address,
         listing_id: u64,
@@ -75,6 +76,7 @@ module UnifiedCompute::escrow {
 
         let now = timestamp::now_seconds();
         let new_job = Job {
+            job_id:new_job_id,
             renter_address: signer::address_of(renter),
             host_address,
             listing_id,
@@ -167,5 +169,23 @@ module UnifiedCompute::escrow {
 
         // Make listing available again
         marketplace::set_listing_available(job.host_address, job.listing_id);
+    }
+
+    #[view]
+    public fun get_job(job_id: u64): Job acquires EscrowVault {
+        let vault = borrow_global<EscrowVault>(@UnifiedCompute);
+        assert!(table::contains(&vault.jobs, job_id), E_JOB_NOT_FOUND);
+        let job_ref = table::borrow(&vault.jobs, job_id);
+        Job {
+            job_id: job_ref.job_id, // Explicitly include the job_id
+            renter_address: job_ref.renter_address,
+            host_address: job_ref.host_address,
+            listing_id: job_ref.listing_id,
+            start_time: job_ref.start_time,
+            max_end_time: job_ref.max_end_time,
+            total_escrow_amount: job_ref.total_escrow_amount,
+            claimed_amount: job_ref.claimed_amount,
+            is_active: job_ref.is_active,
+        }
     }
 }
