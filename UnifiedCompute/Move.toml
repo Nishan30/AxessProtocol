@@ -4,9 +4,15 @@ version = "1.0.0"
 
 [addresses]
 # Replace 0x... with your actual Testnet account address
-UnifiedCompute = "0x3fb9d35ce83b7cc58d9b3202eaf58dc4014e569529fea6b62750f5f4f7d7cf91"
+UnifiedCompute = "0xbc0dcdc34fb0f3df03f29c382b28aec81b2a28b0f7ae2de62728cf0d36846b97"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-core.git"
 rev = "testnet"
 subdir = "aptos-move/framework/aptos-framework"
+
+[dependencies.AptosStdlib]
+git = "https://github.com/aptos-labs/aptos-core.git"
+rev = "testnet"
+subdir = "aptos-move/framework/aptos-stdlib"
+
