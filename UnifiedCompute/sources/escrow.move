@@ -7,6 +7,7 @@ module UnifiedCompute::escrow {
     use aptos_framework::aptos_coin::AptosCoin;
     use aptos_framework::coin::{Self as coin, Coin};
     use aptos_std::table::{Self as table, Table};
+    use UnifiedCompute::reputation::{Self, ReputationVault};
 
     // ✅ Correct ed25519 path + types used by Aptos stdlib
     use aptos_std::ed25519::{Self as ed25519, Signature, UnvalidatedPublicKey};
@@ -20,6 +21,12 @@ module UnifiedCompute::escrow {
     const E_JOB_INACTIVE: u64 = 5;
     const E_BAD_DURATION: u64 = 6;
     const E_CLAIM_TIME: u64 = 7;
+
+    // --- NEW: Add a resource to track jobs by renter ---
+    // This is the on-chain index you need.
+    struct RenterJobs has key {
+        job_ids: vector<u64>,
+    }
 
     struct EscrowVault has key {
         jobs: Table<u64, Job>,
@@ -57,10 +64,11 @@ module UnifiedCompute::escrow {
         host_address: address,
         listing_id: u64,
         duration_seconds: u64
-    ) acquires EscrowVault {
+    ) acquires EscrowVault, RenterJobs {
         assert!(duration_seconds > 0, E_BAD_DURATION);
 
         let vault = borrow_global_mut<EscrowVault>(@UnifiedCompute);
+        let renter_address = signer::address_of(renter);
 
         let new_job_id = vault.next_job_id;
         vault.next_job_id = vault.next_job_id + 1;
@@ -90,12 +98,20 @@ module UnifiedCompute::escrow {
         // Record job + store coins
         table::add<u64, Job>(&mut vault.jobs, new_job_id, new_job);
         table::add<u64, Coin<AptosCoin>>(&mut vault.job_funds, new_job_id, escrowed_coins);
+
+        // --- NEW: Add the job ID to the renter's personal job list ---
+        if (!exists<RenterJobs>(renter_address)) {
+            move_to(renter, RenterJobs { job_ids: vector::empty() });
+        };
+        let renter_jobs = borrow_global_mut<RenterJobs>(renter_address);
+        vector::push_back(&mut renter_jobs.job_ids, new_job_id);
     }
 
     public entry fun claim_payment(
         host: &signer,
         job_id: u64,
         claim_timestamp: u64,
+        final_session_duration: u64
     ) acquires EscrowVault {
         let host_address = signer::address_of(host);
         let vault = borrow_global_mut<EscrowVault>(@UnifiedCompute);
@@ -139,6 +155,14 @@ module UnifiedCompute::escrow {
 
         // Update claimed amount
         job.claimed_amount = job.claimed_amount + payment_to_claim;
+
+        if (job.claimed_amount >= job.total_escrow_amount || claim_timestamp >= job.max_end_time) {
+            job.is_active = false;
+            // Make listing available again
+            marketplace::set_listing_available(job.host_address, job.listing_id);
+            // Record the job's success in the reputation module
+            reputation::record_job_completion(job.host_address, final_session_duration);
+        }
     }
 
 
@@ -165,10 +189,16 @@ module UnifiedCompute::escrow {
             coin::destroy_zero<AptosCoin>(remaining_coins);
         };
 
+        let actual_duration = timestamp::now_seconds() - job.start_time;
+        if (actual_duration > (job.max_end_time - job.start_time)) {
+            actual_duration = job.max_end_time - job.start_time;
+        };
+
         job.is_active = false;
 
         // Make listing available again
         marketplace::set_listing_available(job.host_address, job.listing_id);
+        reputation::record_job_completion(job.host_address, actual_duration);
     }
 
     #[view]
@@ -187,5 +217,25 @@ module UnifiedCompute::escrow {
             claimed_amount: job_ref.claimed_amount,
             is_active: job_ref.is_active,
         }
+    }
+
+    #[view]
+    public fun get_jobs_by_renter(renter_address: address): vector<Job> acquires EscrowVault, RenterJobs {
+        if (!exists<RenterJobs>(renter_address)) { return vector::empty() };
+        
+        let renter_jobs = borrow_global<RenterJobs>(renter_address);
+        let vault = borrow_global<EscrowVault>(@UnifiedCompute);
+        
+        let out = vector::empty<Job>();
+        let i = 0;
+        while (i < vector::length(&renter_jobs.job_ids)) {
+            let job_id = *vector::borrow(&renter_jobs.job_ids, i);
+            if (table::contains(&vault.jobs, job_id)) {
+                let job = *table::borrow(&vault.jobs, job_id);
+                vector::push_back(&mut out, job);
+            };
+            i = i + 1;
+        };
+        out
     }
 }

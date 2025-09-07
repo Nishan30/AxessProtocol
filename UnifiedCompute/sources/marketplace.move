@@ -27,6 +27,22 @@ module UnifiedCompute::marketplace {
     enum ListingType has store, drop, copy { Cloud(CloudDetails), Physical(PhysicalSpecs) }
     struct ListingManager has key { listings: vector<Listing>, next_listing_id: u64 }
 
+    // --- NEW CONSTANT ---
+    const E_UNAUTHORIZED: u64 = 4;
+
+    // --- Helper function to find a listing's index. This is more efficient. ---
+    fun find_listing_index(manager: &ListingManager, listing_id: u64): (bool, u64) {
+        let i = 0;
+        while (i < vector::length(&manager.listings)) {
+            let listing = vector::borrow(&manager.listings, i);
+            if (listing.id == listing_id) {
+                return (true, i)
+            };
+            i = i + 1;
+        };
+        (false, 0)
+    }
+
     fun get_or_create_manager(host: &signer) {
         let host_addr = signer::address_of(host);
         if (!exists<ListingManager>(host_addr)) {
@@ -97,6 +113,22 @@ module UnifiedCompute::marketplace {
         manager.next_listing_id = manager.next_listing_id + 1;
     }
 
+    public entry fun delist_machine(host: &signer, listing_id: u64) acquires ListingManager {
+        let host_addr = signer::address_of(host);
+        assert!(exists<ListingManager>(host_addr), E_UNAUTHORIZED);
+        let manager = borrow_global_mut<ListingManager>(host_addr);
+
+        let (found, index) = find_listing_index(manager, listing_id);
+        assert!(found, E_LISTING_NOT_FOUND);
+
+        let listing = vector::borrow(&manager.listings, index);
+        // A host can only delist a machine if it's not currently rented.
+        assert!(listing.is_available, E_LISTING_NOT_AVAILABLE);
+
+        // This safely removes the element from the vector by its index.
+        vector::swap_remove(&mut manager.listings, index);
+    }
+
     // --- NEW, ENCAPSULATED FRIEND FUNCTION ---
     // This function is called by escrow. It handles all state changes for the marketplace.
     // It finds the listing, checks if it's available, marks it as rented, and returns the price.
@@ -104,33 +136,39 @@ module UnifiedCompute::marketplace {
         host_address: address, listing_id: u64, job_id: u64
     ): u64 acquires ListingManager {
         let manager = borrow_global_mut<ListingManager>(host_address);
-        let i = 0;
-        while (i < vector::length(&manager.listings)) {
-            let listing = vector::borrow_mut(&mut manager.listings, i);
-            if (listing.id == listing_id) {
-                assert!(listing.is_available, E_LISTING_NOT_AVAILABLE);
-                listing.is_available = false;
-                listing.active_job_id = some(job_id);
-                return listing.price_per_second
-            };
-            i = i + 1;
-        };
-        abort E_LISTING_NOT_FOUND
+        let (found, index) = find_listing_index(manager, listing_id);
+        assert!(found, E_LISTING_NOT_FOUND);
+
+        let listing = vector::borrow_mut(&mut manager.listings, index);
+        assert!(listing.is_available, E_LISTING_NOT_AVAILABLE);
+        listing.is_available = false;
+        listing.active_job_id = some(job_id);
+        return listing.price_per_second
     }
 
     public(friend) fun set_listing_available(host_address: address, listing_id: u64) acquires ListingManager {
         let manager = borrow_global_mut<ListingManager>(host_address);
-        let i = 0;
-        while (i < vector::length(&manager.listings)) {
-            let listing = vector::borrow_mut(&mut manager.listings, i);
-            if (listing.id == listing_id) {
-                listing.is_available = true;
-                listing.active_job_id = none();
-                return
-            };
-            i = i + 1;
-        };
-        abort E_LISTING_NOT_FOUND
+        let (found, index) = find_listing_index(manager, listing_id);
+        assert!(found, E_LISTING_NOT_FOUND);
+        
+        let listing = vector::borrow_mut(&mut manager.listings, index);
+        listing.is_available = true;
+        listing.active_job_id = none();
+    }
+
+    // --- NEW: A simple admin function for a host to reset their own listing ---
+    // This is safer than a generic function.
+    public entry fun force_reset_listing_as_host(host: &signer, listing_id: u64) acquires ListingManager {
+        let host_addr = signer::address_of(host);
+        assert!(exists<ListingManager>(host_addr), E_UNAUTHORIZED);
+        let manager = borrow_global_mut<ListingManager>(host_addr);
+
+        let (found, index) = find_listing_index(manager, listing_id);
+        assert!(found, E_LISTING_NOT_FOUND);
+
+        let listing_mut = vector::borrow_mut(&mut manager.listings, index);
+        listing_mut.is_available = true;
+        listing_mut.active_job_id = none();
     }
 
     #[view]
