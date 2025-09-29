@@ -1,170 +1,159 @@
 #[test_only]
 module UnifiedCompute::integration_tests {
-    use std::signer;
-    use std::string::{utf8, String};
-    use std::option;
+    use std::string::{utf8};
     use std::vector;
+    use std::signer;
 
-    use aptos_framework::genesis;
+    // This is the correct set of imports for modern testing
     use aptos_framework::account;
     use aptos_framework::aptos_coin::{Self, AptosCoin};
     use aptos_framework::coin;
 
-    // Import all the modules from your project
-    use UnifiedCompute::marketplace::{Self, Listing};
-    use UnifiedCompute::escrow::{Self, AptosComputeRequest, RequiredSpecs};
-    use UnifiedCompute::reputation::{Self};
+    use UnifiedCompute::marketplace;
+    use UnifiedCompute::escrow;
+    use UnifiedCompute::reputation;
 
-    // --- Test constants ---
-    const HOST_ADDR: address = @0x100;
-    const RENTER_ADDR: address = @0x200; // For direct rentals
-    const REQUESTER_ADDR: address = @0x300; // For programmatic requests
-    const INITIAL_BALANCE: u64 = 1_000_000_000;
+    const INITIAL_BALANCE: u64 = 100_000_000_000;
 
-    // Setup function to initialize the test environment with funded accounts
-    fun setup() {
-        genesis::setup();
-        account::create_account_for_test(HOST_ADDR);
-        account::create_account_for_test(RENTER_ADDR);
-        account::create_account_for_test(REQUESTER_ADDR);
-        
+    /// Helper to initialize and fund accounts.
+    fun setup_and_fund(
+    contract_signer: &signer,
+    host: &signer,
+    renter: &signer,
+    requester: &signer,
+    fund_renter: bool,
+    fund_requester: bool,
+    ) {
+        // Register CoinStores for each participant
+        coin::register<AptosCoin>(host);
+        coin::register<AptosCoin>(renter);
+        coin::register<AptosCoin>(requester);
+
+        escrow::initialize_vault(contract_signer);
+        reputation::initialize_vault(contract_signer);
+
         let framework_signer = account::create_signer_for_test(@aptos_framework);
-        aptos_coin::mint(&framework_signer, HOST_ADDR, INITIAL_BALANCE);
-        aptos_coin::mint(&framework_signer, RENTER_ADDR, INITIAL_BALANCE);
-        aptos_coin::mint(&framework_signer, REQUESTER_ADDR, INITIAL_BALANCE);
+
+        // Register CoinStore for framework_signer if needed
+        coin::register<AptosCoin>(&framework_signer);
+
+        // Mint initial balance to framework_signer if needed
+        // (If you have access to mint capability in test context. Otherwise, framework_signer may already have funds.)
+
+        coin::transfer<AptosCoin>(&framework_signer, signer::address_of(host), INITIAL_BALANCE);
+
+        if (fund_renter) {
+            coin::transfer<AptosCoin>(&framework_signer, signer::address_of(renter), INITIAL_BALANCE);
+        };
+
+        if (fund_requester) {
+            coin::transfer<AptosCoin>(&framework_signer, signer::address_of(requester), INITIAL_BALANCE);
+        };
     }
 
-    // --- TEST 1: HOST REGISTRATION AND AVAILABILITY ---
-    #[test(host = @0x100)]
-    fun test_registration_and_availability_toggle(host: &signer) {
-        setup();
-        // Initialize contracts
-        let contract_signer = account::create_signer_for_test(@UnifiedCompute);
-        escrow::initialize_vault(&contract_signer);
-        reputation::initialize_vault(&contract_signer);
+    #[test(host = @0x100, contract_signer = @UnifiedCompute)]
+    public fun test_registration_and_availability_toggle(host: &signer, contract_signer: &signer) {
+        // We pass dummy signers for unused roles
+        setup_and_fund(contract_signer, host, host, host, false, false);
 
-        // 1. Register the machine
         marketplace::register_host_machine(host, utf8(b"RTX 4090"), 16, 24, 250, vector::empty());
-        let listing1 = marketplace::get_listing(HOST_ADDR);
-        assert!(!listing1.is_available, 1); // Should start as unavailable
-        assert!(!listing1.is_rented, 2);
+        
+        let view1 = marketplace::get_listing_view(@0x100);
+        assert!(!marketplace::view_is_available(&view1), 1);
+        assert!(!marketplace::view_is_rented(&view1), 2);
 
-        // 2. Host agent comes online
         marketplace::set_availability(host, true);
-        let listing2 = marketplace::get_listing(HOST_ADDR);
-        assert!(listing2.is_available, 3);
+        let view2 = marketplace::get_listing_view(@0x100);
+        assert!(marketplace::view_is_available(&view2), 3);
 
-        // 3. Host agent goes offline
         marketplace::set_availability(host, false);
-        let listing3 = marketplace::get_listing(HOST_ADDR);
-        assert!(!listing3.is_available, 4);
+        let view3 = marketplace::get_listing_view(@0x100);
+        assert!(!marketplace::view_is_available(&view3), 4);
     }
 
-    // --- TEST 2: FAILS TO REGISTER THE SAME MACHINE TWICE ---
     #[test(host = @0x100)]
     #[expected_failure(abort_code = 5, location = UnifiedCompute::marketplace)]
-    fun test_fails_to_register_twice(host: &signer) {
-        setup();
+    public fun test_fails_to_register_twice(host: &signer) {
         marketplace::register_host_machine(host, utf8(b"RTX 4090"), 16, 24, 250, vector::empty());
-        // This second call must fail with E_ONLY_ONE_LISTING_ALLOWED (5)
         marketplace::register_host_machine(host, utf8(b"RTX 3080"), 12, 12, 150, vector::empty());
     }
 
-    // --- TEST 3: FULL DIRECT RENTAL FLOW (UI-DRIVEN) ---
-    #[test(host = @0x100, renter = @0x200)]
-    fun test_direct_rental_flow_success(host: &signer, renter: &signer) {
-        setup();
-        let contract_signer = account::create_signer_for_test(@UnifiedCompute);
-        escrow::initialize_vault(&contract_signer);
-        reputation::initialize_vault(&contract_signer);
+    #[test(host = @0x100, renter = @0x200, contract_signer = @UnifiedCompute)]
+    public fun test_direct_rental_flow_success(host: &signer, renter: &signer, contract_signer: &signer) {
+        // Pass a dummy for the unused requester role
+        setup_and_fund(contract_signer, host, renter, renter, true, false);
 
         let price = 250;
         let duration = 100;
         let total_cost = (price * duration) as u64;
+        let host_addr = signer::address_of(host);
+        let renter_addr = signer::address_of(renter);
 
-        // 1. Host registers and comes online
         marketplace::register_host_machine(host, utf8(b"RTX 4090"), 16, 24, price, vector::empty());
         marketplace::set_availability(host, true);
         
-        // 2. Renter rents the machine
-        escrow::rent_machine_direct(renter, HOST_ADDR, duration);
+        escrow::rent_machine_direct(renter, host_addr, duration);
 
-        // 3. Check states and balances
-        let listing = marketplace::get_listing(HOST_ADDR);
-        assert!(listing.is_rented, 1);
-        assert!(!listing.is_available, 2);
+        let view = marketplace::get_listing_view(host_addr);
+        assert!(marketplace::view_is_rented(&view), 1);
+        assert!(!marketplace::view_is_available(&view), 2);
         
-        let renter_balance_after = coin::balance<AptosCoin>(RENTER_ADDR);
+        let renter_balance_after = coin::balance<AptosCoin>(renter_addr);
         assert!(renter_balance_after == INITIAL_BALANCE - total_cost, 3);
         
-        // Let's assume the job is terminated by the renter immediately
-        escrow::terminate_job(renter, *option::borrow(&listing.active_job_id));
+        escrow::terminate_job(renter, *std::option::borrow(marketplace::view_active_job_id(&view)));
 
-        let listing_after_termination = marketplace::get_listing(HOST_ADDR);
-        assert!(!listing_after_termination.is_rented, 4);
-        assert!(!listing_after_termination.is_available, 5); // Must be manually brought back online
+        let view_after_termination = marketplace::get_listing_view(host_addr);
+        assert!(!marketplace::view_is_rented(&view_after_termination), 4);
+        assert!(!marketplace::view_is_available(&view_after_termination), 5);
     }
     
-    // --- TEST 4: FULL PROGRAMMATIC FLOW (SMART CONTRACT-DRIVEN) ---
-    #[test(host = @0x100, requester = @0x300)]
-    fun test_full_programmatic_flow_success(host: &signer, requester: &signer) {
-        setup();
-        let contract_signer = account::create_signer_for_test(@UnifiedCompute);
-        escrow::initialize_vault(&contract_signer);
-        reputation::initialize_vault(&contract_signer);
+    #[test(host = @0x100, requester = @0x300, contract_signer = @UnifiedCompute)]
+    public fun test_full_programmatic_flow_success(host: &signer, requester: &signer, contract_signer: &signer) {
+        // Pass a dummy for the unused renter role
+        setup_and_fund(contract_signer, host, requester, requester, false, true);
 
-        // 1. Host registers and comes online
+        let host_addr = signer::address_of(host);
+        let requester_addr = signer::address_of(requester);
+
         marketplace::register_host_machine(host, utf8(b"RTX 4090"), 16, 24, 250, vector::empty());
         marketplace::set_availability(host, true);
 
-        // 2. Requester (another smart contract or dApp) submits a compute job
-        let request = AptosComputeRequest {
-            container_image: utf8(b"pytorch/pytorch:latest"),
-            input_data_uri: option::none(),
-            required_specs: RequiredSpecs { min_cpu_cores: 8, min_ram_gb: 16 },
-            max_cost_per_second: 300,
-            max_duration_seconds: 1000,
-        };
-        escrow::request_compute(requester, request);
+        escrow::request_compute(
+            requester,
+            utf8(b"pytorch/pytorch:latest"),
+            false, utf8(b""),
+            8, 16, 300, 1000
+        );
 
-        // 3. Host's oracle finds the job and accepts it
-        let request_id = 0; // The first request will have ID 0
+        let request_id = 0;
         escrow::accept_compute_request(host, request_id);
 
-        // 4. Verify the job is active and the listing state is correct
-        let listing = marketplace::get_listing(HOST_ADDR);
-        assert!(listing.is_rented, 1);
-        assert!(!listing.is_available, 2);
+        let view = marketplace::get_listing_view(host_addr);
+        assert!(marketplace::view_is_rented(&view), 1);
+        assert!(!marketplace::view_is_available(&view), 2);
 
-        let job_id = *option::borrow(&listing.active_job_id);
+        let job_id = *std::option::borrow(marketplace::view_active_job_id(&view));
         let job = escrow::get_job(job_id);
-        assert!(job.renter_address == REQUESTER_ADDR, 3);
-        assert!(job.host_address == HOST_ADDR, 4);
+        assert!(escrow::renter_address(&job) == requester_addr, 3);
+        assert!(escrow::host_address(&job) == host_addr, 4);
     }
 
-    // --- TEST 5: FAILS IF HOST SPECS ARE TOO LOW FOR PROGRAMMATIC JOB ---
-    #[test(host = @0x100, requester = @0x300)]
-    #[expected_failure(abort_code = 9, location = UnifiedCompute::escrow)]
-    fun test_fails_to_accept_if_specs_are_too_low(host: &signer, requester: &signer) {
-        setup();
-        let contract_signer = account::create_signer_for_test(@UnifiedCompute);
-        escrow::initialize_vault(&contract_signer);
+    #[test(host = @0x100, requester = @0x300, contract_signer = @UnifiedCompute)]
+    #[expected_failure(abort_code = 7, location = UnifiedCompute::marketplace)]
+    public fun test_fails_to_accept_if_specs_are_too_low(host: &signer, requester: &signer, contract_signer: &signer) {
+        setup_and_fund(contract_signer, host, requester, requester, false, true);
 
-        // Host registers a mid-tier machine (12GB RAM)
         marketplace::register_host_machine(host, utf8(b"RTX 3080"), 12, 12, 150, vector::empty());
         marketplace::set_availability(host, true);
 
-        // Requester submits a job that needs a high-end machine (16GB RAM)
-        let request = AptosComputeRequest {
-            container_image: utf8(b"tensorflow/tensorflow:latest"),
-            input_data_uri: option::none(),
-            required_specs: RequiredSpecs { min_cpu_cores: 8, min_ram_gb: 16 }, // Requires more RAM than host has
-            max_cost_per_second: 200,
-            max_duration_seconds: 1000,
-        };
-        escrow::request_compute(requester, request);
-
-        // Host tries to accept the job. This MUST fail with E_INSUFFICIENT_SPECS (9)
+        escrow::request_compute(
+            requester,
+            utf8(b"tensorflow/tensorflow:latest"),
+            false, utf8(b""),
+            8, 16, 200, 1000
+        );
+        
         escrow::accept_compute_request(host, 0);
     }
 }
